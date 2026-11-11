@@ -4,6 +4,8 @@ import ssl
 import sys
 import urllib.parse
 import urllib.request
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from openai import OpenAI
 
@@ -42,13 +44,13 @@ WEATHER_CODES = {
     99: "雷暴伴大冰雹",
 }
 
-CITY_COORDS = {
-    "北京": (39.9042, 116.4074),
-    "上海": (31.2304, 121.4737),
-    "广州": (23.1291, 113.2644),
-    "深圳": (22.5431, 114.0579),
-    "杭州": (30.2741, 120.1551),
-    "成都": (30.5728, 104.0668),
+CITY_INFO = {
+    "北京": (39.9042, 116.4074, "Asia/Shanghai"),
+    "上海": (31.2304, 121.4737, "Asia/Shanghai"),
+    "广州": (23.1291, 113.2644, "Asia/Shanghai"),
+    "深圳": (22.5431, 114.0579, "Asia/Shanghai"),
+    "杭州": (30.2741, 120.1551, "Asia/Shanghai"),
+    "成都": (30.5728, 104.0668, "Asia/Shanghai"),
 }
 
 WEATHER_TOOL = {
@@ -66,6 +68,23 @@ WEATHER_TOOL = {
     },
 }
 
+TIME_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_current_time",
+        "description": "查询指定城市的当前日期和时间。当用户询问现在几点、今天几号、星期几、当前时间时调用。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "城市名称，例如：北京"},
+            },
+            "required": ["city"],
+        },
+    },
+}
+
+TOOLS = [WEATHER_TOOL, TIME_TOOL]
+
 
 def get_client() -> OpenAI:
     api_key = os.environ.get("DEEPSEEK_API_KEY")
@@ -81,8 +100,9 @@ def build_system_prompt(model: str) -> str:
         "你是一个中文聊天助手，由 DeepSeek 大模型驱动。"
         f"你当前使用的模型名称（API model ID）是「{model}」。"
         "当用户询问你是什么模型时，直接回答这个模型名称，不要含糊。"
-        "当用户询问实时天气时，必须调用 get_weather 工具获取真实数据，"
-        "不要凭记忆或猜测回答。"
+        "当用户询问实时天气时，必须调用 get_weather 工具获取真实数据；"
+        "当用户询问当前时间、日期、星期几时，必须调用 get_current_time 工具。"
+        "不要凭记忆或猜测回答这类实时信息。"
     )
 
 
@@ -107,7 +127,7 @@ def _http_get_json(url: str) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _geocode(city: str):
+def _lookup_city(city: str) -> dict:
     try:
         url = "https://geocoding-api.open-meteo.com/v1/search?" + urllib.parse.urlencode(
             {"name": city, "count": 1, "language": "zh", "format": "json"}
@@ -115,28 +135,33 @@ def _geocode(city: str):
         results = _http_get_json(url).get("results")
         if results:
             item = results[0]
-            return item["latitude"], item["longitude"], item.get("name", city)
+            return {
+                "name": item.get("name", city),
+                "lat": item["latitude"],
+                "lon": item["longitude"],
+                "timezone": item.get("timezone") or "UTC",
+            }
     except Exception:
         pass
-    if city in CITY_COORDS:
-        lat, lon = CITY_COORDS[city]
-        return lat, lon, city
+    if city in CITY_INFO:
+        lat, lon, tz = CITY_INFO[city]
+        return {"name": city, "lat": lat, "lon": lon, "timezone": tz}
     raise ValueError(f"未找到城市：{city}")
 
 
 def get_weather(city: str) -> dict:
-    lat, lon, name = _geocode(city)
+    info = _lookup_city(city)
     url = "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(
         {
-            "latitude": lat,
-            "longitude": lon,
+            "latitude": info["lat"],
+            "longitude": info["lon"],
             "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
             "timezone": "auto",
         }
     )
     current = _http_get_json(url)["current"]
     return {
-        "city": name,
+        "city": info["name"],
         "condition": WEATHER_CODES.get(current["weather_code"], f"天气代码{current['weather_code']}"),
         "temperature_c": current["temperature_2m"],
         "feels_like_c": current["apparent_temperature"],
@@ -147,13 +172,34 @@ def get_weather(city: str) -> dict:
     }
 
 
+def get_current_time(city: str) -> dict:
+    info = _lookup_city(city)
+    now = datetime.now(ZoneInfo(info["timezone"]))
+    weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+    return {
+        "city": info["name"],
+        "timezone": info["timezone"],
+        "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "weekday": weekdays[now.weekday()],
+        "source": "系统时钟",
+    }
+
+
+def dispatch(name: str, args: dict) -> dict:
+    if name == "get_weather":
+        return get_weather(args.get("city", ""))
+    if name == "get_current_time":
+        return get_current_time(args.get("city", ""))
+    raise ValueError(f"未知工具：{name}")
+
+
 def run_turn(client: OpenAI, messages: list, model: str) -> None:
     printed_any = False
     for _ in range(MAX_TOOL_ROUNDS):
         stream = client.chat.completions.create(
             model=model,
             messages=messages,
-            tools=[WEATHER_TOOL],
+            tools=TOOLS,
             stream=True,
         )
         content_parts = []
@@ -207,7 +253,7 @@ def run_turn(client: OpenAI, messages: list, model: str) -> None:
         for tc in tool_calls:
             try:
                 args = json.loads(tc["arguments"] or "{}")
-                result = get_weather(args.get("city", ""))
+                result = dispatch(tc["name"], args)
             except Exception as exc:
                 result = {"error": str(exc)}
             messages.append(
